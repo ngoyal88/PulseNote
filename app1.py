@@ -4,6 +4,8 @@ os.environ["TRANSFORMERS_NO_FLAX"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from PIL import Image
 try:
     import fitz  # PyMuPDF
@@ -12,27 +14,42 @@ except ImportError:
     st.stop()
 import io
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    st.error("AI library not installed. Run: pip install google-generativeai")
-    st.stop()
-
 # ------------------------------
 # CONFIG
 # ------------------------------
+MODEL_PATH = "models/soap_generator"  # your trained model folder
 
+@st.cache_resource
 def load_model():
-    """Load the SOAP generation model."""
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
-    # Store in session state for OCR access
-    if 'model' not in st.session_state:
-        st.session_state['model'] = model
-    
-    return model
+    """Load tokenizer + model once and cache them."""
+    try:
+        # Force PyTorch backend only
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_PATH,
+            use_fast=True,
+            local_files_only=True
+        )
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            MODEL_PATH,
+            local_files_only=True,
+            torch_dtype=torch.float32
+        )
 
-model = load_model()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+
+        return tokenizer, model, device
+    except Exception as e:
+        st.error(f"❌ Failed to load model from {MODEL_PATH}")
+        st.error(f"Error details: {str(e)}")
+        st.info("💡 Make sure:")
+        st.info("1. Model files exist in models/soap_generator/")
+        st.info("2. PyTorch is installed (not TensorFlow)")
+        st.info("3. Run: pip uninstall tensorflow tensorflow-gpu")
+        st.stop()
+
+
+tokenizer, model, device = load_model()
 
 # ------------------------------
 # OCR SECTION
@@ -50,60 +67,13 @@ def extract_text_from_pdf(uploaded_file):
 
 def extract_text_from_image(uploaded_file):
     try:
-        # Use the main model for OCR
+        import pytesseract
         img = Image.open(uploaded_file)
-        
-        # Convert image to bytes for Gemini
-        import io
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format=img.format or 'PNG')
-        img_byte_arr = img_byte_arr.getvalue()
-        
-        # Use Gemini for OCR
-        response = model.generate_content([
-            "Extract all text from this medical document. Preserve the original structure, formatting, and layout as much as possible. Return only the extracted text without any commentary or explanations.",
-            {"mime_type": "image/png", "data": img_byte_arr}
-        ])
-        
-        text = response.text
-        return text if text.strip() else "No text detected in image."
-        
+        return pytesseract.image_to_string(img)
+    except ImportError:
+        return "❌ Tesseract not installed. Install it from: https://github.com/UB-Mannheim/tesseract/wiki"
     except Exception as e:
-        # Fallback to EasyOCR with preprocessing
-        try:
-            import easyocr
-            import numpy as np
-            import cv2
-            
-            # Initialize reader (cached after first use)
-            if 'ocr_reader' not in st.session_state:
-                with st.spinner("Loading OCR model..."):
-                    st.session_state.ocr_reader = easyocr.Reader(['en'], gpu=False)
-            
-            reader = st.session_state.ocr_reader
-            
-            # Reset file pointer
-            uploaded_file.seek(0)
-            img = Image.open(uploaded_file)
-            
-            # Convert to grayscale and apply preprocessing
-            img_array = np.array(img)
-            if len(img_array.shape) == 3:
-                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = img_array
-            
-            # Apply thresholding to improve OCR
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Perform OCR
-            result = reader.readtext(thresh, detail=0, paragraph=True)
-            text = '\n'.join(result)
-            
-            return text if text.strip() else "No text detected in image."
-            
-        except Exception as fallback_error:
-            return f"OCR Error: Could not extract text from image. {str(fallback_error)}"
+        return f"OCR Error: {str(e)}"
 
 
 # ------------------------------
@@ -181,68 +151,44 @@ def format_soap_output(sections):
     return formatted if formatted else "No structured output generated."
 
 def generate_soap(text):
-    """Generate SOAP note using trained neural network model."""
+    """Generate SOAP note using your fine-tuned T5 model."""
+
+    prompt = "Generate SOAP note: " + text
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    ).to(device)
+
+    outputs = model.generate(
+        **inputs,
+        max_length=256,
+        num_beams=4,
+        early_stopping=True
+    )
+
+    raw_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
-    prompt = f"""
-You are a medical documentation assistant. Convert the following clinical note into a professional SOAP note.
-
-Clinical Note:
-{text}
-
-Strict Instructions:
-• Output must contain exactly four sections: SUBJECTIVE, OBJECTIVE, ASSESSMENT, and PLAN.
-• Each section must be written as a single paragraph only.
-• Do NOT use bullet points, numbered lists, line breaks inside a section, or multiple paragraphs.
-• Maintain clinical tone, accuracy, and conciseness.
-• Use medical terminology when appropriate.
-• Include only meaningful and relevant clinical information.
-
-SOAP Format (must follow this exactly):
-SUBJECTIVE: One paragraph describing symptoms, complaints, patient history, and subjective information only.
-OBJECTIVE: One paragraph summarizing physical exam findings, vitals, tests, or diagnostic information.
-ASSESSMENT: One paragraph describing clinical impression, differential diagnosis, or medical reasoning.
-PLAN: One paragraph describing treatment, medications, tests, follow-up, and recommendations.
-
-Output Requirements:
-• Each section is strictly one paragraph only.
-• Keep the note concise and professional.
-"""
-
-    try:
-        response = model.generate_content(prompt)
-        raw_output = response.text
-        
-        # Parse and structure the output
-        sections = parse_soap_sections(raw_output)
-        formatted = format_soap_output(sections)
-        
-        return formatted, sections
-    except Exception as e:
-        error_msg = f"Model Error: {type(e).__name__}: {str(e)}"
-        st.error(error_msg)
-        
-        # Show helpful tips based on error type
-        if "quota" in str(e).lower():
-            st.warning("⚠️ Model usage limit reached - Try again later")
-        elif "blocked" in str(e).lower() or "safety" in str(e).lower():
-            st.warning("🚫 Content was filtered - Try rephrasing the input")
-        else:
-            st.warning("⚠️ Model processing error - Please try again")
-        
-        return f"❌ Failed to generate SOAP note.\n\n{error_msg}", {}
+    # Parse and structure the output
+    sections = parse_soap_sections(raw_output)
+    formatted = format_soap_output(sections)
+    
+    return formatted, sections
 
 
 # ------------------------------
 # STREAMLIT UI
 # ------------------------------
 st.set_page_config(
-    page_title="PulseNote – SOAP Generator",
+    page_title="MediCode – SOAP Generator",
     page_icon="🩺",
     layout="wide"
 )
 
-st.title("🩺 PulseNote – Clinical SOAP Note Generator")
-st.write("Advanced medical note processing system.")
+st.title("🩺 MediCode – Clinical SOAP Note Generator")
+st.write("A fully local, privacy-friendly medical summarizer.")
 
 
 # ------------------------------
@@ -321,4 +267,3 @@ if run_button:
             file_name="soap_note.txt",
             mime="text/plain"
         )
-
